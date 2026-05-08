@@ -108,7 +108,9 @@ export function rowToTopic(row: CurriculumTopicRow): CurriculumTopic {
 }
 
 export function areaCode(sectionTitle: string) {
-  return sectionTitle.trim().charAt(0).toUpperCase();
+  const trimmed = sectionTitle.trim();
+  const prefixedCode = trimmed.match(/^([^:]+)\s*:/)?.[1]?.trim();
+  return (prefixedCode || trimmed.charAt(0)).toUpperCase();
 }
 
 export function areaTitle(code: string) {
@@ -130,7 +132,7 @@ export function areaTitle(code: string) {
 
 export function normalizeTitle(value: string) {
   return value
-    .replace(/^[A-E]\s*:\s*/i, "")
+    .replace(/^[^:]{1,60}\s*:\s*/i, "")
     .replace(/\s+/g, " ")
     .trim();
 }

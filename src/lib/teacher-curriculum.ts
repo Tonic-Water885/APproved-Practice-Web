@@ -112,10 +112,12 @@ export function collapseTeacherData(data: TeacherCurriculumData): TeacherCurricu
   return { areas, subtopics, units, phrases };
 }
 
-export function sortRows<T extends { sort_index: number | null; title_en?: string; text_en?: string }>(rows: T[]) {
+export function sortRows<T extends { id?: string; sort_index: number | null; title_en?: string; text_en?: string }>(rows: T[]) {
   return [...rows].sort((a, b) => {
     const sortDiff = (a.sort_index ?? 0) - (b.sort_index ?? 0);
     if (sortDiff !== 0) return sortDiff;
+    const idDiff = (a.id ?? "").localeCompare(b.id ?? "");
+    if (idDiff !== 0) return idDiff;
     return (a.title_en ?? a.text_en ?? "").localeCompare(b.title_en ?? b.text_en ?? "");
   });
 }

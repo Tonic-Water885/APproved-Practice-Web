@@ -70,6 +70,16 @@ type SessionPrompt = {
   topicTitle: string;
   sectionTitle: string;
 };
+type TeacherTableName = "curriculum_areas" | "curriculum_subtopics" | "curriculum_units" | "curriculum_phrases";
+type PublishScope = { areaID?: string; subtopicID?: string; unitID?: string };
+type AddResultSummary = {
+  parsedRows: number;
+  skippedDuplicates: number;
+  insertedRows: number;
+  publishedRows?: number;
+};
+
+const curriculumPageSize = 1000;
 
 const roleLabels: Record<string, string> = {
   student: "Student",
@@ -84,6 +94,35 @@ const resultLabels: Record<LearnResult, string> = {
 };
 
 const storageKeyFor = (userID: string) => `approved-practice.progress.${userID}`;
+
+async function fetchAllTeacherRows<T>(table: TeacherTableName, publishedOnly = false) {
+  const rows: T[] = [];
+  let nextStart = 0;
+
+  while (true) {
+    let query = supabase
+      .from(table)
+      .select("*");
+
+    if (publishedOnly) {
+      query = query.eq("is_published", true);
+    }
+
+    const { data, error } = await query
+      .order("sort_index", { ascending: true })
+      .order("id", { ascending: true })
+      .range(nextStart, nextStart + curriculumPageSize - 1);
+    if (error) return { data: null, error };
+
+    const pageRows = (data ?? []) as T[];
+    rows.push(...pageRows);
+
+    if (pageRows.length < curriculumPageSize) break;
+    nextStart += curriculumPageSize;
+  }
+
+  return { data: rows, error: null };
+}
 
 export default function Home() {
   const [session, setSession] = useState<Session | null>(null);
@@ -132,22 +171,28 @@ export default function Home() {
 
   const fetchCurriculum = useCallback(async (showSuccess = false) => {
     setCurriculumLoading(true);
-    const { data, error } = await supabase
-      .from("curriculum_topics")
-      .select(
-        "id,sort_index,section_en,subsection_en,subsection_fr,subsection_it,subsection_es,phrases_en,phrases_fr,phrases_it,phrases_es,updated_at,created_by,is_published,source_type,created_at",
-      )
-      .order("sort_index", { ascending: true });
+    const [areas, subtopics, units, phrases] = await Promise.all([
+      fetchAllTeacherRows<TeacherAreaRow>("curriculum_areas", true),
+      fetchAllTeacherRows<TeacherSubtopicRow>("curriculum_subtopics", true),
+      fetchAllTeacherRows<TeacherUnitRow>("curriculum_units", true),
+      fetchAllTeacherRows<TeacherPhraseRow>("curriculum_phrases", true),
+    ]);
 
-    if (error) {
-      setMessage(`Curriculum could not load: ${error.message}`);
+    const normalizedError = areas.error ?? subtopics.error ?? units.error ?? phrases.error;
+    if (normalizedError) {
+      setMessage(`Curriculum could not load: ${normalizedError.message}`);
       setCurriculumLoading(false);
       return false;
-    } else {
-      setRows((data ?? []) as CurriculumTopicRow[]);
-      if (showSuccess) {
-        showToast("Curriculum refreshed successfully.");
-      }
+    }
+
+    setRows(normalizedRowsToCurriculumTopics({
+      areas: (areas.data ?? []) as TeacherAreaRow[],
+      subtopics: (subtopics.data ?? []) as TeacherSubtopicRow[],
+      units: (units.data ?? []) as TeacherUnitRow[],
+      phrases: (phrases.data ?? []) as TeacherPhraseRow[],
+    }));
+    if (showSuccess) {
+      showToast("Curriculum refreshed successfully.");
     }
     setCurriculumLoading(false);
     return true;
@@ -610,19 +655,25 @@ function SetupFlow({
   const [playAudio, setPlayAudio] = useState(true);
   const [timerSeconds, setTimerSeconds] = useState(progress.preferredTimerSeconds);
 
-  const grouped = groupSectionsByArea(curriculum);
-  const selectedCount = selected.size;
   const fixedDirectionMode = mode === "write" || mode === "listening";
   const studyLanguage = target === "en" ? "fr" : target;
   const effectiveSource = fixedDirectionMode ? (mode === "listening" ? studyLanguage : "en") : source;
   const effectiveTarget = fixedDirectionMode ? (mode === "listening" ? "en" : studyLanguage) : target;
+  const filteredCurriculum = useMemo(
+    () => filterCurriculumForLanguages(curriculum, [effectiveSource, effectiveTarget]),
+    [curriculum, effectiveSource, effectiveTarget],
+  );
+  const grouped = groupSectionsByArea(filteredCurriculum);
+  const availableTopicIDs = useMemo(() => new Set(filteredCurriculum.topics.map((topic) => topic.id)), [filteredCurriculum]);
+  const visibleSelected = useMemo(() => new Set([...selected].filter((id) => availableTopicIDs.has(id))), [availableTopicIDs, selected]);
+  const selectedCount = visibleSelected.size;
 
   function start() {
     onStart(
       {
         sourceLanguage: effectiveSource,
         targetLanguage: effectiveTarget,
-        topicIDs: [...selected],
+        topicIDs: [...visibleSelected],
         phraseIDs: fixedPhraseIDs,
         timerSeconds,
         timerEnabled,
@@ -713,10 +764,10 @@ function SetupFlow({
         </label>
       </section>
       {!fixedPhraseIDs ? (
-        <TopicSelector grouped={grouped} selected={selected} setSelected={setSelected} />
+        <TopicSelector grouped={grouped} selected={visibleSelected} setSelected={setSelected} />
       ) : null}
       <div className="sticky bottom-4 z-10">
-        <button className="primary-button shadow-xl" disabled={!fixedPhraseIDs && selected.size === 0} onClick={start}>
+        <button className="primary-button shadow-xl" disabled={!fixedPhraseIDs && visibleSelected.size === 0} onClick={start}>
           Start
         </button>
       </div>
@@ -1134,29 +1185,34 @@ function TopicsView({
   const [openArea, setOpenArea] = useState<string | null>(null);
   const [openSectionID, setOpenSectionID] = useState<string | null>(null);
   const [selectedTopic, setSelectedTopic] = useState<CurriculumTopic | null>(null);
-  const grouped = groupSectionsByArea(curriculum);
+  const browseLanguage = studyLanguageFromProgress(progress);
+  const filteredCurriculum = useMemo(() => filterCurriculumForLanguages(curriculum, ["en", browseLanguage]), [browseLanguage, curriculum]);
+  const grouped = groupSectionsByArea(filteredCurriculum);
   const openGroup = grouped.find((group) => group.code === openArea) ?? null;
   const openSection = openGroup?.sections.find((section) => section.id === openSectionID) ?? null;
+  const visibleSelectedTopic = selectedTopic && filteredCurriculum.topics.some((topic) => topic.id === selectedTopic.id)
+    ? selectedTopic
+    : null;
 
-  if (selectedTopic) {
+  if (visibleSelectedTopic) {
     return (
       <div className="space-y-5">
         <button className="icon-text" onClick={() => setSelectedTopic(null)}>
           <ChevronLeft size={18} /> {openSection ? displayTitle(openSection.title) : "Topics"}
         </button>
         <section className="panel p-5">
-          <p className="text-sm font-black text-slate-500">{displayTitle(selectedTopic.sectionTitle)}</p>
-          <h2 className="mt-1 text-3xl font-black">{normalizeTitle(selectedTopic.titles.en)}</h2>
-          <p className="mt-2 font-semibold text-slate-600">{selectedTopic.phrases.length} phrases</p>
-          <PhraseList topic={selectedTopic} progress={progress} setProgress={setProgress} />
+          <p className="text-sm font-black text-slate-500">{displayTitle(visibleSelectedTopic.sectionTitle)}</p>
+          <h2 className="mt-1 text-3xl font-black">{normalizeTitle(visibleSelectedTopic.titles.en)}</h2>
+          <p className="mt-2 font-semibold text-slate-600">{visibleSelectedTopic.phrases.length} phrases</p>
+          <PhraseList topic={visibleSelectedTopic} language={browseLanguage} progress={progress} setProgress={setProgress} />
           <div className="mt-4 grid gap-3 sm:grid-cols-3">
-            <button className="primary-button" onClick={() => onStart(makeDefaultConfig(progress, [selectedTopic.id]), "learn")}>
+            <button className="primary-button" onClick={() => onStart(makeDefaultConfig(progress, [visibleSelectedTopic.id]), "learn")}>
               Learn Topic
             </button>
-            <button className="secondary-button" onClick={() => onStart(makeDefaultConfig(progress, [selectedTopic.id]), "write")}>
+            <button className="secondary-button" onClick={() => onStart(makeDefaultConfig(progress, [visibleSelectedTopic.id]), "write")}>
               Write
             </button>
-            <button className="secondary-button" onClick={() => onStart(makeDefaultConfig(progress, [selectedTopic.id]), "choice")}>
+            <button className="secondary-button" onClick={() => onStart(makeDefaultConfig(progress, [visibleSelectedTopic.id]), "choice")}>
               Multiple Choice
             </button>
           </div>
@@ -1165,12 +1221,16 @@ function TopicsView({
     );
   }
 
+  if (grouped.length === 0) {
+    return <EmptyState title="No topics for this language" body="Choose another language in practice settings, or add translations for this language in Teacher Tools." />;
+  }
+
   return (
     <div className="space-y-5">
       <header className="flex flex-wrap items-end justify-between gap-3">
         <div>
           <h2 className="text-4xl font-black">
-            {openSection ? displayTitle(openSection.title) : openGroup ? `${openGroup.code}: ${openGroup.title}` : "Topics"}
+            {openSection ? displayTitle(openSection.title) : openGroup ? areaGroupLabel(openGroup) : "Topics"}
           </h2>
           <p className="mt-1 font-semibold text-slate-600">
             {openSection ? "Choose a subtopic to view phrases." : openGroup ? "Choose a curriculum subtopic." : "Browse vocabulary with curriculum topics."}
@@ -1178,9 +1238,9 @@ function TopicsView({
         </div>
         {openSection ? (
           <button className="secondary-button compact" onClick={() => setOpenSectionID(null)}>
-            <ChevronLeft size={17} /> {openGroup ? `${openGroup.code}: ${openGroup.title}` : "Area"}
+            <ChevronLeft size={17} /> {openGroup ? areaGroupLabel(openGroup) : "Area"}
           </button>
-        ) : openArea ? (
+        ) : openGroup ? (
           <button
             className="secondary-button compact"
             onClick={() => {
@@ -1192,7 +1252,7 @@ function TopicsView({
           </button>
         ) : null}
       </header>
-      {!openArea ? (
+      {!openGroup ? (
         <div className="grid gap-5">
           {grouped.map((group) => (
             <AreaCard key={group.code} group={group} onClick={() => setOpenArea(group.code)} />
@@ -1241,7 +1301,11 @@ function SavedView({
     tab === "starred"
       ? progress.starredPhraseIDs
       : Object.entries(progress.phraseStatuses).filter(([, status]) => status === "forgot").map(([id]) => id);
-  const topics = topicsForPhraseIDs(curriculum, phraseIDs);
+  const displayLanguage = studyLanguageFromProgress(progress);
+  const filteredCurriculum = useMemo(() => filterCurriculumForLanguages(curriculum, ["en", displayLanguage]), [curriculum, displayLanguage]);
+  const topics = topicsForPhraseIDs(filteredCurriculum, phraseIDs);
+  const availablePhraseIDs = new Set(filteredCurriculum.phrases.map((phrase) => phrase.id));
+  const visiblePhraseIDs = phraseIDs.filter((id) => availablePhraseIDs.has(id));
 
   return (
     <div className="space-y-5">
@@ -1250,17 +1314,17 @@ function SavedView({
         <button className={tab === "mistakes" ? "active" : ""} onClick={() => setTab("mistakes")}>Mistakes</button>
         <button className={tab === "starred" ? "active" : ""} onClick={() => setTab("starred")}>Starred</button>
       </div>
-      {phraseIDs.length ? (
+      {visiblePhraseIDs.length ? (
         <>
           <div className="grid gap-3">
             {topics.map((topic) => (
               <section className="panel p-4" key={topic.id}>
                 <h3 className="font-black">{normalizeTitle(topic.titles.en)}</h3>
-                <PhraseList topic={topic} progress={progress} setProgress={setProgress} />
+                <PhraseList topic={topic} language={displayLanguage} progress={progress} setProgress={setProgress} />
               </section>
             ))}
           </div>
-          <button className="primary-button" onClick={() => onStart(makeDefaultConfig(progress, [], phraseIDs), "flashcards")}>
+          <button className="primary-button" onClick={() => onStart(makeDefaultConfig(progress, [], visiblePhraseIDs), "flashcards")}>
             Practice {tab === "mistakes" ? "Mistakes" : "Starred"}
           </button>
         </>
@@ -1305,12 +1369,15 @@ function TeacherTools({
   const [bulkPairs, setBulkPairs] = useState("");
   const [phraseDraft, setPhraseDraft] = useState({ text_en: "", text_fr: "", text_it: "", text_es: "" });
   const [undo, setUndo] = useState<{ label: string; run: () => Promise<void> } | null>(null);
-  const [hasUnpublishedChanges, setHasUnpublishedChanges] = useState(false);
+  const [, setHasUnpublishedChanges] = useState(false);
+  const [, setLastAddSummary] = useState<AddResultSummary | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<{ node: TeacherNode; total: number; restore: TeacherCurriculumData; ids: string[] } | null>(null);
 
   const selectedAreaSubtopics = areaChoice === "existing" && areaID ? subtopicsFor(data, areaID) : [];
   const selectedSubtopicUnits = subtopicChoice === "existing" && subtopicID ? unitsFor(data, subtopicID) : [];
   const selectedBulkLanguages = (["fr", "es", "it"] as Exclude<AppLanguage, "en">[]).filter((language) => languageTicks[language]);
   const bulkPlaceholder = `English phrase==${selectedBulkLanguages.map((language) => languageLabel(language)).join("**") || "Translation"}\nI like school==${selectedBulkLanguages.map((language) => ({ fr: "J'aime l'école", es: "Me gusta el colegio", it: "Mi piace la scuola" })[language]).join("**")}`;
+  const bulkPreviewRows = parseMultilingualPhraseRows(bulkPairs, selectedBulkLanguages);
 
   function markTeacherDirty(isDirty: boolean) {
     setHasUnpublishedChanges(isDirty);
@@ -1320,10 +1387,10 @@ function TeacherTools({
   const fetchTeacherData = useCallback(async () => {
     setLoading(true);
     const [areas, subtopics, units, phrases] = await Promise.all([
-      supabase.from("curriculum_areas").select("*").order("sort_index", { ascending: true }),
-      supabase.from("curriculum_subtopics").select("*").order("sort_index", { ascending: true }),
-      supabase.from("curriculum_units").select("*").order("sort_index", { ascending: true }),
-      supabase.from("curriculum_phrases").select("*").order("sort_index", { ascending: true }),
+      fetchAllTeacherRows<TeacherAreaRow>("curriculum_areas"),
+      fetchAllTeacherRows<TeacherSubtopicRow>("curriculum_subtopics"),
+      fetchAllTeacherRows<TeacherUnitRow>("curriculum_units"),
+      fetchAllTeacherRows<TeacherPhraseRow>("curriculum_phrases"),
     ]);
     const error = areas.error ?? subtopics.error ?? units.error ?? phrases.error;
     if (error) {
@@ -1369,7 +1436,7 @@ function TeacherTools({
     onMessage(message);
   }
 
-  async function saveAddChanges() {
+  async function saveAddChanges(publishImmediately = false) {
     setSaving(true);
     const createdIDs: { table: string; id: string }[] = [];
     let resolvedAreaID = areaID;
@@ -1446,7 +1513,8 @@ function TeacherTools({
 
     const existingPhraseKeys = new Set(phrasesFor(data, resolvedUnitID).map((phrase) => teacherKey(phrase.text_en)));
     const phraseStartIndex = phrasesFor(data, resolvedUnitID).length;
-    const phrases = parseMultilingualPhraseRows(bulkPairs, selectedBulkLanguages)
+    const parsedPhrases = parseMultilingualPhraseRows(bulkPairs, selectedBulkLanguages);
+    const phrases = parsedPhrases
       .filter((phrase) => !existingPhraseKeys.has(teacherKey(phrase.text_en)))
       .map((phrase, index) => ({
         ...phrase,
@@ -1455,9 +1523,11 @@ function TeacherTools({
         created_by: userID,
         is_published: false,
       }));
+    const skippedDuplicates = parsedPhrases.length - phrases.length;
 
     if (phrases.length === 0) {
-      onMessage("No new phrases were added because they already exist in that sub-subtopic.");
+      setLastAddSummary({ parsedRows: parsedPhrases.length, skippedDuplicates, insertedRows: 0 });
+      onMessage(`Parsed ${parsedPhrases.length} row${parsedPhrases.length === 1 ? "" : "s"}, skipped ${skippedDuplicates} duplicate${skippedDuplicates === 1 ? "" : "s"}, inserted 0 rows.`);
       setSaving(false);
       return;
     }
@@ -1470,27 +1540,38 @@ function TeacherTools({
     }
     createdIDs.push(...(result.data ?? []).map((row) => ({ table: "curriculum_phrases", id: row.id })));
 
-    if (createdIDs.length) {
-      setUndo({
-        label: `Undo add`,
-        run: async () => {
-          if (!window.confirm("Undo this add? The new items will be removed.")) return;
-          for (const row of [...createdIDs].reverse()) {
-            await supabase.from(row.table).delete().eq("id", row.id);
-          }
-          setUndo(null);
-          markTeacherDirty(true);
-          await reloadAfterChange("Add undone. Publish when ready.");
-        },
-      });
-      resetDrafts();
-      markTeacherDirty(true);
-      await reloadAfterChange("Added. Press Publish Changes when ready.");
+    const addSummary = { parsedRows: parsedPhrases.length, skippedDuplicates, insertedRows: phrases.length };
+    setLastAddSummary(addSummary);
+    const scope = { areaID: resolvedAreaID, subtopicID: resolvedSubtopicID, unitID: resolvedUnitID };
+    setUndo({
+      label: `Undo add`,
+      run: async () => {
+        if (!window.confirm("Undo this add? The new items will be removed.")) return;
+        for (const row of [...createdIDs].reverse()) {
+          await supabase.from(row.table).delete().eq("id", row.id);
+        }
+        setUndo(null);
+        markTeacherDirty(true);
+        await reloadAfterChange("Add undone. Publish when ready.");
+      },
+    });
+    resetDrafts();
+    markTeacherDirty(true);
+    if (publishImmediately) {
+      const publishedRows = await publishScopes([scope], false);
+      if (publishedRows !== null) {
+        markTeacherDirty(false);
+        const publishedSummary = { ...addSummary, publishedRows };
+        setLastAddSummary(publishedSummary);
+        await reloadAfterChange(addSummaryText(publishedSummary));
+      }
+    } else {
+      await reloadAfterChange(`${addSummaryText(addSummary)} Press Publish Changes when ready.`);
     }
     setSaving(false);
   }
 
-  async function updateNode() {
+  async function updateNode(publishImmediately = false) {
     if (!editNode) return;
     setSaving(true);
     const previous = editNode.row;
@@ -1528,20 +1609,34 @@ function TeacherTools({
       });
       resetDrafts();
       markTeacherDirty(true);
-      await reloadAfterChange("Updated. Press Publish Changes when ready.");
+      if (publishImmediately) {
+        const publishedRows = await publishScopes([scopeForNode(data, editNode)], false);
+        if (publishedRows !== null) {
+          markTeacherDirty(false);
+          await reloadAfterChange(`Updated and published ${publishedRows} row${publishedRows === 1 ? "" : "s"}.`);
+        }
+      } else {
+        await reloadAfterChange("Updated. Press Publish Changes when ready.");
+      }
     }
     setSaving(false);
   }
 
   async function deleteNode(node: TeacherNode) {
     const total = countDescendants(data, node);
-    const warning = node.level === "phrase"
-      ? ""
-      : `\n\nThis will also remove the ${total - 1} item${total - 1 === 1 ? "" : "s"} inside it.`;
-    if (!window.confirm(`Delete this ${teacherLevelLabels[node.level].toLowerCase()}?\n\n${nodeLabel(node)}${warning}`)) return;
-    setSaving(true);
     const restore = rowsForRestore(data, node);
     const deleteIDs = matchingRawIDsForNode(rawData, node);
+    setPendingDelete({ node, total, restore, ids: deleteIDs.length ? deleteIDs : [node.row.id] });
+    markTeacherDirty(true);
+  }
+
+  async function publishDelete() {
+    if (!pendingDelete) return;
+    const warning = pendingDelete.node.level === "phrase"
+      ? ""
+      : `\n\nThis will also remove the ${pendingDelete.total - 1} item${pendingDelete.total - 1 === 1 ? "" : "s"} inside it.`;
+    if (!window.confirm(`Publish this deletion?\n\n${nodeLabel(pendingDelete.node)}${warning}\n\nTotal rows affected: ${pendingDelete.total}`)) return;
+    setSaving(true);
     const { data: sessionData } = await supabase.auth.getSession();
     if (!sessionData.session?.access_token) {
       onMessage("Delete failed: please sign in again.");
@@ -1556,10 +1651,10 @@ function TeacherTools({
         Authorization: `Bearer ${sessionData.session.access_token}`,
       },
       body: JSON.stringify({
-        level: node.level,
-        id: node.row.id,
-        ids: deleteIDs.length ? deleteIDs : [node.row.id],
-        match: deleteMatchForNode(rawData, node),
+        level: pendingDelete.node.level,
+        id: pendingDelete.node.row.id,
+        ids: pendingDelete.ids,
+        match: deleteMatchForNode(rawData, pendingDelete.node),
       }),
     });
     const result = await response.json();
@@ -1567,53 +1662,51 @@ function TeacherTools({
     if (!response.ok) {
       onMessage(`Delete failed: ${result.error ?? "Unknown error"}`);
     } else {
-      setData((current) => removeNodeFromTeacherData(current, node));
-      markTeacherDirty(true);
       setUndo({
-        label: `Undo delete (${total} row${total === 1 ? "" : "s"})`,
+        label: `Undo delete (${pendingDelete.total} row${pendingDelete.total === 1 ? "" : "s"})`,
         run: async () => {
           if (!window.confirm("Undo this delete? The removed content will be restored.")) return;
-          if (restore.areas.length) await supabase.from("curriculum_areas").insert(restore.areas);
-          if (restore.subtopics.length) await supabase.from("curriculum_subtopics").insert(restore.subtopics);
-          if (restore.units.length) await supabase.from("curriculum_units").insert(restore.units);
-          if (restore.phrases.length) await supabase.from("curriculum_phrases").insert(restore.phrases);
+          if (pendingDelete.restore.areas.length) await supabase.from("curriculum_areas").insert(pendingDelete.restore.areas);
+          if (pendingDelete.restore.subtopics.length) await supabase.from("curriculum_subtopics").insert(pendingDelete.restore.subtopics);
+          if (pendingDelete.restore.units.length) await supabase.from("curriculum_units").insert(pendingDelete.restore.units);
+          if (pendingDelete.restore.phrases.length) await supabase.from("curriculum_phrases").insert(pendingDelete.restore.phrases);
           setUndo(null);
           markTeacherDirty(true);
           await reloadAfterChange("Delete undone.");
         },
       });
-      await reloadAfterChange("Deleted. Press Publish Changes when ready.");
+      setPendingDelete(null);
+      markTeacherDirty(false);
+      await reloadAfterChange("Deletion published.");
     }
     setSaving(false);
   }
 
-  async function publish(confirmFirst = true) {
-    if (confirmFirst && !window.confirm("Publish your normalized curriculum into the iOS-compatible curriculum table?")) return false;
+  async function publishScopes(scopes: PublishScope[], confirmFirst = true) {
+    if (confirmFirst && !window.confirm("Publish these curriculum changes?")) return null;
     setPublishing(true);
     const { data: sessionData } = await supabase.auth.getSession();
     if (!sessionData.session?.access_token) {
       onMessage("Publish failed: please sign in again.");
       setPublishing(false);
-      return false;
+      return null;
     }
     const response = await fetch("/api/teacher/publish", {
       method: "POST",
       headers: {
+        "Content-Type": "application/json",
         Authorization: `Bearer ${sessionData.session.access_token}`,
       },
+      body: JSON.stringify({ scopes }),
     });
     const result = await response.json();
     if (!response.ok) {
       onMessage(`Publish failed: ${result.error ?? "Unknown error"}`);
       setPublishing(false);
-      return false;
-    } else {
-      markTeacherDirty(false);
-      onMessage(`Published ${result.published} curriculum updates.`);
-      await onChanged();
+      return null;
     }
     setPublishing(false);
-    return true;
+    return Number(result.published ?? 0);
   }
 
   function chooseEditNode(node: TeacherNode) {
@@ -1732,14 +1825,10 @@ function TeacherTools({
             ))}
           </div>
           <TextArea label="Bulk import phrases" value={bulkPairs} onChange={setBulkPairs} placeholder={bulkPlaceholder} />
-          <div className="flex flex-wrap gap-2">
-            <button className="primary-button" disabled={saving || !canPublishTeacherAdd(areaChoice, subtopicChoice, unitChoice, areaID, subtopicID, unitID, newAreaTitle, newSubtopicTitle, newUnitTitle, selectedBulkLanguages, bulkPairs)} onClick={() => void saveAddChanges()}>
-              <Save size={18} /> {saving ? "Saving..." : "Save Add"}
-            </button>
-            <button className="secondary-button" disabled={publishing || loading || !hasUnpublishedChanges} onClick={() => void publish()}>
-              <Save size={18} /> {publishing ? "Publishing..." : "Publish Changes"}
-            </button>
-          </div>
+          <BulkImportPreview rows={bulkPreviewRows} languages={selectedBulkLanguages} />
+          <button className="primary-button" disabled={saving || publishing || !canPublishTeacherAdd(areaChoice, subtopicChoice, unitChoice, areaID, subtopicID, unitID, newAreaTitle, newSubtopicTitle, newUnitTitle, selectedBulkLanguages, bulkPairs)} onClick={() => void saveAddChanges(true)}>
+            <Save size={18} /> {saving || publishing ? "Publishing..." : "Publish Changes"}
+          </button>
         </section>
       ) : null}
 
@@ -1752,34 +1841,45 @@ function TeacherTools({
                 <div className="space-y-3">
                   <h3 className="section-heading">Edit {teacherLevelLabels[editNode.level]}</h3>
                   {editNode.level === "phrase" ? (
-                    <div className="grid gap-3 md:grid-cols-2">
-                      <Input label="English" value={phraseDraft.text_en} onChange={(value) => setPhraseDraft({ ...phraseDraft, text_en: value })} placeholder="English" />
-                      <Input label="French" value={phraseDraft.text_fr} onChange={(value) => setPhraseDraft({ ...phraseDraft, text_fr: value })} placeholder="French" />
-                      <Input label="Italian" value={phraseDraft.text_it} onChange={(value) => setPhraseDraft({ ...phraseDraft, text_it: value })} placeholder="Italian" />
-                      <Input label="Spanish" value={phraseDraft.text_es} onChange={(value) => setPhraseDraft({ ...phraseDraft, text_es: value })} placeholder="Spanish" />
+                    <div className="grid gap-3">
+                      <Input label="English" value={phraseDraft.text_en} onChange={(value) => setPhraseDraft({ ...phraseDraft, text_en: value })} placeholder="English" multiline />
+                      <Input label="French" value={phraseDraft.text_fr} onChange={(value) => setPhraseDraft({ ...phraseDraft, text_fr: value })} placeholder="French" multiline />
+                      <Input label="Italian" value={phraseDraft.text_it} onChange={(value) => setPhraseDraft({ ...phraseDraft, text_it: value })} placeholder="Italian" multiline />
+                      <Input label="Spanish" value={phraseDraft.text_es} onChange={(value) => setPhraseDraft({ ...phraseDraft, text_es: value })} placeholder="Spanish" multiline />
                     </div>
                   ) : (
-                    <Input label="English title" value={title} onChange={setTitle} placeholder="Title" />
+                    <Input label="English title" value={title} onChange={setTitle} placeholder="Title" multiline />
                   )}
                   <div className="flex gap-2">
-                    <button className="primary-button" disabled={saving} onClick={() => void updateNode()}><Save size={18} /> Save Edit</button>
+                    <button className="primary-button" disabled={saving || publishing} onClick={() => void updateNode(true)}><Save size={18} /> {saving || publishing ? "Publishing..." : "Publish Edit"}</button>
                     <button className="secondary-button compact" onClick={resetDrafts}><X size={18} /> Clear</button>
                   </div>
                 </div>
               ) : <EmptyState title="Choose something to edit" body="Open a dropdown on the left, then press Edit next to any topic, subtopic, sub-subtopic, or phrase." />}
             </section>
           </div>
-          <button className="primary-button" disabled={publishing || loading || !hasUnpublishedChanges} onClick={() => void publish()}>
-            <Save size={18} /> {publishing ? "Publishing..." : "Publish Changes"}
-          </button>
         </section>
       ) : null}
 
       {mode === "delete" ? (
         <section className="panel space-y-4 p-4">
-          <TeacherTree data={data} action="delete" onChoose={(node) => void deleteNode(node)} framed={false} />
-          <button className="primary-button" disabled={publishing || loading || !hasUnpublishedChanges} onClick={() => void publish()}>
-            <Save size={18} /> {publishing ? "Publishing..." : "Publish Changes"}
+          <TeacherTree data={data} action="delete" onChoose={(node) => void deleteNode(node)} framed={false} pendingNode={pendingDelete?.node ?? null} />
+          {pendingDelete ? (
+            <section className="delete-pending-banner">
+              <div>
+                <strong>Ready to delete: {nodeLabel(pendingDelete.node)}</strong>
+                <span>{pendingDelete.total} item{pendingDelete.total === 1 ? "" : "s"} will be removed when you publish.</span>
+              </div>
+              <button className="secondary-button compact" onClick={() => {
+                setPendingDelete(null);
+                markTeacherDirty(false);
+              }}>
+                Cancel
+              </button>
+            </section>
+          ) : null}
+          <button className="primary-button" disabled={saving || !pendingDelete} onClick={() => void publishDelete()}>
+            <Save size={18} /> {saving ? "Publishing..." : "Publish Deletion"}
           </button>
         </section>
       ) : null}
@@ -1808,6 +1908,20 @@ function canPublishTeacherAdd(
   return hasArea && hasSubtopic && hasUnit && languages.length > 0 && bulkPairs.trim().length > 0;
 }
 
+function addSummaryText(summary: AddResultSummary) {
+  const parts = [
+    `Parsed ${summary.parsedRows} row${summary.parsedRows === 1 ? "" : "s"}`,
+    `skipped ${summary.skippedDuplicates} duplicate${summary.skippedDuplicates === 1 ? "" : "s"}`,
+    `inserted ${summary.insertedRows} row${summary.insertedRows === 1 ? "" : "s"}`,
+  ];
+
+  if (typeof summary.publishedRows === "number") {
+    parts.push(`published ${summary.publishedRows} row${summary.publishedRows === 1 ? "" : "s"}`);
+  }
+
+  return `${parts.join(", ")}.`;
+}
+
 function tableForLevel(level: TeacherLevel) {
   return {
     area: "curriculum_areas",
@@ -1826,9 +1940,8 @@ function teacherKey(value: string | null | undefined) {
 }
 
 function areaLabel(area: TeacherAreaRow) {
-  const code = area.code?.trim();
   const title = displayTitle(area.title_en);
-  return code && !title.toLowerCase().startsWith(`${code.toLowerCase()}:`) ? `${code}: ${title}` : title;
+  return isDefaultArea(area) ? `${area.code?.trim()}: ${title}` : title;
 }
 
 function nodeLabel(node: TeacherNode) {
@@ -1964,6 +2077,19 @@ function deleteMatchForNode(data: TeacherCurriculumData, node: TeacherNode) {
   };
 }
 
+function scopeForNode(data: TeacherCurriculumData, node: TeacherNode): PublishScope {
+  if (node.level === "area") return { areaID: node.row.id };
+  if (node.level === "subtopic") return { subtopicID: node.row.id };
+  if (node.level === "unit") return { unitID: node.row.id };
+
+  const parentUnit = data.units.find((unit) => unit.id === node.row.unit_id);
+  return parentUnit ? { unitID: parentUnit.id } : {};
+}
+
+function isSameTeacherNode(left: TeacherNode | null | undefined, right: TeacherNode) {
+  return Boolean(left && left.level === right.level && left.row.id === right.row.id);
+}
+
 function nextAreaCode(areas: TeacherAreaRow[], title: string) {
   const used = new Set(areas.map((area) => area.code?.trim()).filter(Boolean));
   const firstLetter = title.trim().charAt(0).toUpperCase();
@@ -1983,40 +2109,39 @@ function nextAreaCode(areas: TeacherAreaRow[], title: string) {
   return `custom-${index}`;
 }
 
-function removeNodeFromTeacherData(data: TeacherCurriculumData, node: TeacherNode): TeacherCurriculumData {
-  if (node.level === "phrase") {
-    return {
-      ...data,
-      phrases: data.phrases.filter((phrase) => phrase.id !== node.row.id),
-    };
+function BulkImportPreview({ rows, languages }: { rows: ReturnType<typeof parseMultilingualPhraseRows>; languages: Exclude<AppLanguage, "en">[] }) {
+  if (!rows.length) {
+    return (
+      <section className="bulk-preview empty">
+        <strong>Preview</strong>
+        <span>Paste phrases above to check them before publishing.</span>
+      </section>
+    );
   }
 
-  if (node.level === "unit") {
-    return {
-      ...data,
-      units: data.units.filter((unit) => unit.id !== node.row.id),
-      phrases: data.phrases.filter((phrase) => phrase.unit_id !== node.row.id),
-    };
-  }
-
-  if (node.level === "subtopic") {
-    const unitIDs = new Set(data.units.filter((unit) => unit.subtopic_id === node.row.id).map((unit) => unit.id));
-    return {
-      ...data,
-      subtopics: data.subtopics.filter((subtopic) => subtopic.id !== node.row.id),
-      units: data.units.filter((unit) => unit.subtopic_id !== node.row.id),
-      phrases: data.phrases.filter((phrase) => !unitIDs.has(phrase.unit_id)),
-    };
-  }
-
-  const subtopicIDs = new Set(data.subtopics.filter((subtopic) => subtopic.area_id === node.row.id).map((subtopic) => subtopic.id));
-  const unitIDs = new Set(data.units.filter((unit) => subtopicIDs.has(unit.subtopic_id)).map((unit) => unit.id));
-  return {
-    areas: data.areas.filter((area) => area.id !== node.row.id),
-    subtopics: data.subtopics.filter((subtopic) => subtopic.area_id !== node.row.id),
-    units: data.units.filter((unit) => !subtopicIDs.has(unit.subtopic_id)),
-    phrases: data.phrases.filter((phrase) => !unitIDs.has(phrase.unit_id)),
-  };
+  return (
+    <section className="bulk-preview">
+      <strong>Preview</strong>
+      <div className="bulk-preview-table">
+        <table>
+          <thead>
+            <tr>
+              <th>English</th>
+              {languages.map((language) => <th key={language}>{languageLabel(language)}</th>)}
+            </tr>
+          </thead>
+          <tbody>
+            {rows.slice(0, 1).map((row, index) => (
+              <tr key={`${row.text_en}-${index}`}>
+                <td>{row.text_en}</td>
+                {languages.map((language) => <td key={language}>{row[`text_${language}`] || <span className="muted-cell">Empty</span>}</td>)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  );
 }
 
 function TeacherAddStep({
@@ -2075,61 +2200,74 @@ function TeacherTree({
   action,
   onChoose,
   framed = true,
+  pendingNode = null,
 }: {
   data: TeacherCurriculumData;
   action: "edit" | "delete";
   onChoose: (node: TeacherNode) => void;
   framed?: boolean;
+  pendingNode?: TeacherNode | null;
 }) {
   const buttonLabel = action === "edit" ? "Edit" : "Delete";
   const className = framed ? "panel space-y-3 p-4" : "space-y-3";
   return (
     <section className={className}>
       <h3 className="section-heading">{action === "edit" ? "Edit curriculum" : "Delete curriculum"}</h3>
-      {sortRows(data.areas).map((area) => (
-        <details key={area.id} className="teacher-tree-node">
+      {sortRows(data.areas).map((area) => {
+        const areaNode: TeacherNode = { level: "area", row: area };
+        return (
+        <details key={area.id} className={`teacher-tree-node ${isSameTeacherNode(pendingNode, areaNode) ? "pending-delete" : ""}`}>
           <summary>
-            <span>{areaLabel(area)}</span>
-            <button className={action === "delete" ? "danger-button compact" : "secondary-button compact"} onClick={(event) => { event.preventDefault(); onChoose({ level: "area", row: area }); }}>
+            <ChevronDown className="teacher-tree-chevron" size={18} />
+            <span className="teacher-tree-title">{areaLabel(area)}</span>
+            <button className={action === "delete" ? "danger-button compact" : "secondary-button compact"} onClick={(event) => { event.preventDefault(); onChoose(areaNode); }}>
               {buttonLabel}
             </button>
           </summary>
           <div className="teacher-tree-children">
-            {subtopicsFor(data, area.id).map((subtopic) => (
-              <details key={subtopic.id} className="teacher-tree-node">
+            {subtopicsFor(data, area.id).map((subtopic) => {
+              const subtopicNode: TeacherNode = { level: "subtopic", row: subtopic };
+              return (
+              <details key={subtopic.id} className={`teacher-tree-node ${isSameTeacherNode(pendingNode, subtopicNode) ? "pending-delete" : ""}`}>
                 <summary>
-                  <span>{displayTitle(subtopic.title_en)}</span>
-                  <button className={action === "delete" ? "danger-button compact" : "secondary-button compact"} onClick={(event) => { event.preventDefault(); onChoose({ level: "subtopic", row: subtopic }); }}>
+                  <ChevronDown className="teacher-tree-chevron" size={18} />
+                  <span className="teacher-tree-title">{displayTitle(subtopic.title_en)}</span>
+                  <button className={action === "delete" ? "danger-button compact" : "secondary-button compact"} onClick={(event) => { event.preventDefault(); onChoose(subtopicNode); }}>
                     {buttonLabel}
                   </button>
                 </summary>
                 <div className="teacher-tree-children">
-                  {unitsFor(data, subtopic.id).map((unit) => (
-                    <details key={unit.id} className="teacher-tree-node">
+                  {unitsFor(data, subtopic.id).map((unit) => {
+                    const unitNode: TeacherNode = { level: "unit", row: unit };
+                    return (
+                    <details key={unit.id} className={`teacher-tree-node ${isSameTeacherNode(pendingNode, unitNode) ? "pending-delete" : ""}`}>
                       <summary>
-                        <span>{displayTitle(unit.title_en)}</span>
-                        <button className={action === "delete" ? "danger-button compact" : "secondary-button compact"} onClick={(event) => { event.preventDefault(); onChoose({ level: "unit", row: unit }); }}>
+                        <ChevronDown className="teacher-tree-chevron" size={18} />
+                        <span className="teacher-tree-title">{displayTitle(unit.title_en)}</span>
+                        <button className={action === "delete" ? "danger-button compact" : "secondary-button compact"} onClick={(event) => { event.preventDefault(); onChoose(unitNode); }}>
                           {buttonLabel}
                         </button>
                       </summary>
                       <div className="teacher-tree-children">
-                        {phrasesFor(data, unit.id).map((phrase) => (
-                          <article key={phrase.id} className="teacher-phrase-item">
+                        {phrasesFor(data, unit.id).map((phrase) => {
+                          const phraseNode: TeacherNode = { level: "phrase", row: phrase };
+                          return (
+                          <article key={phrase.id} className={`teacher-phrase-item ${isSameTeacherNode(pendingNode, phraseNode) ? "pending-delete" : ""}`}>
                             <span>{phrase.text_en}</span>
-                            <button className={action === "delete" ? "danger-button compact" : "secondary-button compact"} onClick={() => onChoose({ level: "phrase", row: phrase })}>
+                            <button className={action === "delete" ? "danger-button compact" : "secondary-button compact"} onClick={() => onChoose(phraseNode)}>
                               {buttonLabel}
                             </button>
                           </article>
-                        ))}
+                        );})}
                       </div>
                     </details>
-                  ))}
+                  );})}
                 </div>
               </details>
-            ))}
+            );})}
           </div>
         </details>
-      ))}
+      );})}
       {data.areas.length === 0 ? <EmptyState title="No curriculum yet" body="Use Add to create your first topic." /> : null}
     </section>
   );
@@ -2201,16 +2339,20 @@ function SettingsView({
 
 function PhraseList({
   topic,
+  language,
   progress,
   setProgress,
 }: {
   topic: CurriculumTopic;
+  language: Exclude<AppLanguage, "en">;
   progress: ProgressState;
   setProgress: (next: ProgressState | ((current: ProgressState) => ProgressState)) => void;
 }) {
+  const phrases = topic.phrases.filter((phrase) => phrase.translations.en.trim() && phrase.translations[language].trim());
+
   return (
     <div className="mt-3 grid gap-2">
-      {topic.phrases.map((phrase) => (
+      {phrases.map((phrase) => (
         <div key={phrase.id} className="phrase-row">
           <button
             className={`star-button ${progress.starredPhraseIDs.includes(phrase.id) ? "active" : ""}`}
@@ -2227,11 +2369,11 @@ function PhraseList({
           </button>
           <div className="min-w-0 flex-1">
             <p className="font-black">{phrase.translations.en}</p>
-            <p className="font-semibold text-slate-600">{phrase.translations.fr}</p>
+            <p className="font-semibold text-slate-600">{phrase.translations[language]}</p>
           </div>
           <button className="icon-button" onClick={() => {
             unlockSpeech();
-            speak(phrase.translations.fr, "fr");
+            speak(phrase.translations[language], language);
           }}><Volume2 size={18} /></button>
           <StatusPill status={progress.phraseStatuses[phrase.id] ?? "unseen"} />
         </div>
@@ -2249,6 +2391,10 @@ function TopicSelector({
   selected: Set<string>;
   setSelected: (topics: Set<string>) => void;
 }) {
+  if (grouped.length === 0) {
+    return <EmptyState title="No topics for this language" body="Choose another language or add translations for this one in Teacher Tools." />;
+  }
+
   return (
     <section className="panel overflow-hidden">
       {grouped.map((group) => {
@@ -2268,35 +2414,52 @@ function TopicSelector({
               >
                 {allSelected ? <CheckCircle2 size={20} /> : <Circle size={20} />}
               </button>
-              <span className="min-w-0 flex-1"><strong>{group.code}:</strong> {group.title}</span>
+              <span className="min-w-0 flex-1">{areaGroupLabel(group)}</span>
               <ChevronDown className="selector-chevron" size={20} />
             </summary>
             <div className="space-y-2 pb-4 pl-7 pr-4">
-              {group.sections.map((section) => (
-                <details key={section.id} className="selector-section">
-                  <summary>
-                    <span>{displayTitle(section.title)}</span>
-                    <ChevronDown className="selector-chevron" size={18} />
-                  </summary>
-                  <div className="grid gap-2 border-l-2 border-teal-100 py-2 pl-5">
-                    {section.topics.map((topic) => (
+              {group.sections.map((section) => {
+                const sectionTopicIDs = section.topics.map((topic) => topic.id);
+                const sectionSelected = sectionTopicIDs.length > 0 && sectionTopicIDs.every((id) => selected.has(id));
+                return (
+                  <details key={section.id} className="selector-section">
+                    <summary>
                       <button
-                        key={topic.id}
-                        className={`topic-select ${selected.has(topic.id) ? "active" : ""}`}
-                        onClick={() => {
+                        aria-label={`${sectionSelected ? "Clear" : "Select"} ${displayTitle(section.title)}`}
+                        className={`tick-button ${sectionSelected ? "active" : ""}`}
+                        disabled={sectionTopicIDs.length === 0}
+                        onClick={(event) => {
+                          event.preventDefault();
                           const next = new Set(selected);
-                          if (next.has(topic.id)) next.delete(topic.id);
-                          else next.add(topic.id);
+                          sectionTopicIDs.forEach((id) => sectionSelected ? next.delete(id) : next.add(id));
                           setSelected(next);
                         }}
                       >
-                        {selected.has(topic.id) ? <CheckCircle2 size={19} /> : <Circle size={19} />}
-                        {normalizeTitle(topic.titles.en)}
+                        {sectionSelected ? <CheckCircle2 size={18} /> : <Circle size={18} />}
                       </button>
-                    ))}
-                  </div>
-                </details>
-              ))}
+                      <span className="min-w-0 flex-1">{displayTitle(section.title)}</span>
+                      <ChevronDown className="selector-chevron" size={18} />
+                    </summary>
+                    <div className="grid gap-2 border-l-2 border-teal-100 py-2 pl-5">
+                      {section.topics.map((topic) => (
+                        <button
+                          key={topic.id}
+                          className={`topic-select ${selected.has(topic.id) ? "active" : ""}`}
+                          onClick={() => {
+                            const next = new Set(selected);
+                            if (next.has(topic.id)) next.delete(topic.id);
+                            else next.add(topic.id);
+                            setSelected(next);
+                          }}
+                        >
+                          {selected.has(topic.id) ? <CheckCircle2 size={19} /> : <Circle size={19} />}
+                          {normalizeTitle(topic.titles.en)}
+                        </button>
+                      ))}
+                    </div>
+                  </details>
+                );
+              })}
             </div>
           </details>
         );
@@ -2317,11 +2480,15 @@ function RatingButtons({ onRate, suggested }: { onRate: (result: LearnResult) =>
   );
 }
 
-function Input({ label, value, onChange, placeholder, type = "text" }: { label: string; value: string; onChange: (value: string) => void; placeholder: string; type?: string }) {
+function Input({ label, value, onChange, placeholder, type = "text", multiline = false }: { label: string; value: string; onChange: (value: string) => void; placeholder: string; type?: string; multiline?: boolean }) {
   return (
     <label className="block">
       <span className="text-sm font-black text-slate-500">{label}</span>
-      <input className="text-input" value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} type={type} />
+      {multiline ? (
+        <textarea className="text-input edit-textarea" value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} />
+      ) : (
+        <input className="text-input" value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} type={type} />
+      )}
     </label>
   );
 }
@@ -2359,7 +2526,7 @@ function AreaCard({
   return (
     <button className={`area-card tone-${toneByCode[group.code] ?? "blue"}`} onClick={onClick}>
       <span>
-        <strong>{group.code}: {group.title}</strong>
+        <strong>{areaGroupLabel(group)}</strong>
         <small>{group.sections.length} subtopics</small>
         <em>{phraseCount} phrases</em>
       </span>
@@ -2450,15 +2617,68 @@ function LanguageTile({ label }: { label: string }) {
 
 function groupSectionsByArea(curriculum: StoredCurriculum) {
   const groups = new Map<string, typeof curriculum.sections>();
+  const titles = new Map<string, string>();
+  const showCode = new Map<string, boolean>();
+
   for (const section of curriculum.sections) {
     const code = areaCode(section.title);
-    groups.set(code, [...(groups.get(code) ?? []), section]);
+    const prefix = section.title.match(/^([^:]+)\s*:/)?.[1]?.trim() ?? code;
+    const isDefaultArea = /^[A-E]$/.test(code);
+
+    titles.set(code, isDefaultArea ? areaTitle(code) : displayTitle(prefix));
+    showCode.set(code, isDefaultArea);
+    groups.set(code, [...(groups.get(code) ?? []), { ...section, title: normalizeTitle(section.title) }]);
   }
-  return ["A", "B", "C", "D", "E"].filter((code) => groups.has(code)).map((code) => ({
+
+  return Array.from(groups.entries()).map(([code, sections]) => ({
     code,
-    title: areaTitle(code),
-    sections: groups.get(code) ?? [],
+    title: titles.get(code) ?? code,
+    showCode: showCode.get(code) ?? false,
+    sections,
   }));
+}
+
+function areaGroupLabel(group: ReturnType<typeof groupSectionsByArea>[number]) {
+  return group.showCode ? `${group.code}: ${group.title}` : group.title;
+}
+
+function filterCurriculumForLanguages(curriculum: StoredCurriculum, languages: AppLanguage[]): StoredCurriculum {
+  const requiredLanguages = [...new Set(languages)].filter(Boolean);
+  const topics = curriculum.topics
+    .map((topic) => ({
+      ...topic,
+      phrases: topic.phrases.filter((phrase) =>
+        requiredLanguages.every((language) => phrase.translations[language]?.trim()),
+      ),
+    }))
+    .filter((topic) => topic.phrases.length > 0);
+  const topicIDs = new Set(topics.map((topic) => topic.id));
+  const topicByID = new Map(topics.map((topic) => [topic.id, topic]));
+  const sections = curriculum.sections
+    .map((section) => ({
+      ...section,
+      topics: section.topics
+        .filter((topic) => topicIDs.has(topic.id))
+        .map((topic) => topicByID.get(topic.id) ?? topic),
+    }))
+    .filter((section) => section.topics.length > 0);
+
+  return {
+    sections,
+    topics,
+    phrases: topics.flatMap((topic) => topic.phrases),
+  };
+}
+
+function studyLanguageFromProgress(progress: ProgressState): Exclude<AppLanguage, "en"> {
+  if (progress.preferredTargetLanguage !== "en") return progress.preferredTargetLanguage;
+  if (progress.preferredSourceLanguage !== "en") return progress.preferredSourceLanguage;
+  return "fr";
+}
+
+function isDefaultArea(area: TeacherAreaRow) {
+  const code = area.code?.trim().toUpperCase();
+  return Boolean(code && /^[A-E]$/.test(code) && displayTitle(area.title_en) === areaTitle(code));
 }
 
 function makeDefaultConfig(progress: ProgressState, topicIDs: string[], phraseIDs?: string[]): SessionConfig {
@@ -2473,6 +2693,42 @@ function makeDefaultConfig(progress: ProgressState, topicIDs: string[], phraseID
     shuffleEnabled: true,
     playAudioEnabled: progress.preferredPlayAudioEnabled,
   };
+}
+
+function normalizedRowsToCurriculumTopics(data: TeacherCurriculumData): CurriculumTopicRow[] {
+  const rows: CurriculumTopicRow[] = [];
+  const sortedAreas = sortRows(data.areas);
+
+  for (const area of sortedAreas) {
+    const areaPrefix = isDefaultArea(area) ? (area.code?.trim() ?? area.title_en) : area.title_en;
+    const areaSubtopics = sortRows(data.subtopics.filter((subtopic) => subtopic.area_id === area.id));
+    for (const subtopic of areaSubtopics) {
+      const subtopicUnits = sortRows(data.units.filter((unit) => unit.subtopic_id === subtopic.id));
+      for (const unit of subtopicUnits) {
+        const unitPhrases = sortRows(data.phrases.filter((phrase) => phrase.unit_id === unit.id));
+        rows.push({
+          id: unit.id,
+          sort_index: (area.sort_index ?? 0) * 10000 + (subtopic.sort_index ?? 0) * 100 + (unit.sort_index ?? 0),
+          section_en: `${areaPrefix}: ${subtopic.title_en}`,
+          subsection_en: unit.title_en,
+          subsection_fr: unit.title_en,
+          subsection_it: unit.title_en,
+          subsection_es: unit.title_en,
+          phrases_en: unitPhrases.map((phrase) => phrase.text_en),
+          phrases_fr: unitPhrases.map((phrase) => phrase.text_fr ?? ""),
+          phrases_it: unitPhrases.map((phrase) => phrase.text_it ?? ""),
+          phrases_es: unitPhrases.map((phrase) => phrase.text_es ?? ""),
+          updated_at: unit.updated_at,
+          created_by: unit.created_by,
+          is_published: unit.is_published,
+          source_type: "teacher",
+          created_at: unit.created_at,
+        });
+      }
+    }
+  }
+
+  return rows;
 }
 
 function getStats(progress: ProgressState) {

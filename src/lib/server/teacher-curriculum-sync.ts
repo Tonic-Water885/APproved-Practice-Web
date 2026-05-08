@@ -35,20 +35,48 @@ function nextSortIndex(rows: { sort_index: number | null }[]) {
   return rows.reduce((largest, row) => Math.max(largest, row.sort_index ?? 0), 0) + 1;
 }
 
+async function fetchAllRows<T>(supabase: SupabaseClient, table: string, columns = "*") {
+  const pageSize = 1000;
+  const rows: T[] = [];
+  let start = 0;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from(table)
+      .select(columns)
+      .order("sort_index", { ascending: true })
+      .order("id", { ascending: true })
+      .range(start, start + pageSize - 1);
+
+    if (error) return { data: null, error };
+
+    const pageRows = (data ?? []) as T[];
+    rows.push(...pageRows);
+
+    if (pageRows.length < pageSize) break;
+    start += pageSize;
+  }
+
+  return { data: rows, error: null };
+}
+
 export async function ensureFlatCurriculumIsEditable(
   supabase: SupabaseClient,
   userID: string,
   providedFlatRows?: CurriculumTopicRow[],
 ) {
   const [flatResult, areasResult, subtopicsResult, unitsResult, phrasesResult] = await Promise.all([
-    supabase
-      .from("curriculum_topics")
-      .select("id,sort_index,section_en,subsection_en,subsection_fr,subsection_it,subsection_es,phrases_en,phrases_fr,phrases_it,phrases_es,updated_at,created_by,is_published,source_type,created_at")
-      .order("sort_index", { ascending: true }),
-    supabase.from("curriculum_areas").select("*").order("sort_index", { ascending: true }),
-    supabase.from("curriculum_subtopics").select("*").order("sort_index", { ascending: true }),
-    supabase.from("curriculum_units").select("*").order("sort_index", { ascending: true }),
-    supabase.from("curriculum_phrases").select("*").order("sort_index", { ascending: true }),
+    providedFlatRows
+      ? Promise.resolve({ data: providedFlatRows, error: null })
+      : fetchAllRows<CurriculumTopicRow>(
+          supabase,
+          "curriculum_topics",
+          "id,sort_index,section_en,subsection_en,subsection_fr,subsection_it,subsection_es,phrases_en,phrases_fr,phrases_it,phrases_es,updated_at,created_by,is_published,source_type,created_at",
+        ),
+    fetchAllRows<TeacherAreaRow>(supabase, "curriculum_areas"),
+    fetchAllRows<TeacherSubtopicRow>(supabase, "curriculum_subtopics"),
+    fetchAllRows<TeacherUnitRow>(supabase, "curriculum_units"),
+    fetchAllRows<TeacherPhraseRow>(supabase, "curriculum_phrases"),
   ]);
 
   const readError = (providedFlatRows ? null : flatResult.error) ?? areasResult.error ?? subtopicsResult.error ?? unitsResult.error ?? phrasesResult.error;
