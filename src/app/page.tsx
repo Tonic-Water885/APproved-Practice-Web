@@ -2718,6 +2718,7 @@ function normalizedRowsToCurriculumTopics(data: TeacherCurriculumData): Curricul
           phrases_fr: unitPhrases.map((phrase) => phrase.text_fr ?? ""),
           phrases_it: unitPhrases.map((phrase) => phrase.text_it ?? ""),
           phrases_es: unitPhrases.map((phrase) => phrase.text_es ?? ""),
+          phrase_ids: unitPhrases.map((phrase) => phrase.id),
           updated_at: unit.updated_at,
           created_by: unit.created_by,
           is_published: unit.is_published,

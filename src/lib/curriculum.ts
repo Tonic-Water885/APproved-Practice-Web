@@ -41,8 +41,12 @@ function speech() {
   return window.speechSynthesis;
 }
 
-let currentAudio: HTMLAudioElement | null = null;
-let currentSpeechRequest: AbortController | null = null;
+const browserVoiceNames: Record<AppLanguage, string[]> = {
+  en: ["Daniel", "Google UK English Male", "Microsoft Ryan", "Samantha", "Alex"],
+  fr: ["Thomas", "Amelie", "Amélie", "Google français", "Microsoft Henri", "Microsoft Denise"],
+  it: ["Alice", "Google italiano", "Microsoft Elsa", "Microsoft Isabella"],
+  es: ["Monica", "Mónica", "Google español", "Microsoft Alvaro", "Microsoft Elvira"],
+};
 
 export function buildCurriculum(rows: CurriculumTopicRow[]): StoredCurriculum {
   const orderedRows = [...rows].sort((a, b) => (a.sort_index ?? 0) - (b.sort_index ?? 0));
@@ -79,7 +83,7 @@ export function rowToTopic(row: CurriculumTopicRow): CurriculumTopic {
   );
   const topicID = `topic-${row.id}`;
   const phrases: CurriculumPhrase[] = Array.from({ length: phraseCount }, (_, index) => ({
-    id: `${topicID}-phrase-${index}`,
+    id: row.phrase_ids?.[index] ?? `${topicID}-phrase-${index}`,
     index,
     translations: {
       en: row.phrases_en?.[index] ?? "",
@@ -179,41 +183,7 @@ export function speak(text: string, language: AppLanguage) {
     return false;
   }
 
-  if (currentAudio) {
-    currentAudio.pause();
-    currentAudio = null;
-  }
-
-  currentSpeechRequest?.abort();
-  const speechRequest = new AbortController();
-  currentSpeechRequest = speechRequest;
-
-  void fetch(`/api/tts?direct=1&lang=${encodeURIComponent(language)}&text=${encodeURIComponent(trimmed)}`, {
-    signal: speechRequest.signal,
-  })
-    .then((response) => {
-      if (!response.ok) throw new Error("Device TTS failed");
-    })
-    .catch((error) => {
-      if (error instanceof DOMException && error.name === "AbortError") return;
-      playGeneratedAudio(trimmed, language);
-    });
-
-  return true;
-}
-
-function playGeneratedAudio(text: string, language: AppLanguage) {
-  const audio = new Audio(`/api/tts?lang=${encodeURIComponent(language)}&text=${encodeURIComponent(text)}`);
-  audio.preload = "auto";
-  currentAudio = audio;
-  audio.addEventListener("ended", () => {
-    if (currentAudio === audio) currentAudio = null;
-  });
-  audio.addEventListener("error", () => {
-    if (currentAudio === audio) currentAudio = null;
-    speakInBrowser(text, language);
-  });
-  void audio.play().catch(() => speakInBrowser(text, language));
+  return speakInBrowser(trimmed, language);
 }
 
 function speakInBrowser(text: string, language: AppLanguage) {
@@ -231,10 +201,34 @@ function speakInBrowser(text: string, language: AppLanguage) {
   synth.cancel();
   const utterance = new window.SpeechSynthesisUtterance(trimmed);
   utterance.lang = languageVoice(language);
+  const voice = bestBrowserVoice(synth.getVoices(), language);
+  if (voice) {
+    utterance.voice = voice;
+    utterance.lang = voice.lang;
+  }
   utterance.volume = 1;
   utterance.rate = 0.92;
   utterance.pitch = 1;
   synth.speak(utterance);
   synth.resume();
   return true;
+}
+
+function bestBrowserVoice(voices: SpeechSynthesisVoice[], language: AppLanguage) {
+  const locale = languageVoice(language).toLowerCase();
+  const languageCode = locale.split("-")[0];
+  const candidates = voices.filter((voice) => voice.lang.toLowerCase().startsWith(languageCode));
+  const preferredNames = browserVoiceNames[language].map((name) => name.toLowerCase());
+
+  return candidates
+    .map((voice) => {
+      const name = voice.name.toLowerCase();
+      const preferredIndex = preferredNames.findIndex((preferred) => name.includes(preferred));
+      const exactLocale = voice.lang.toLowerCase() === locale ? 30 : 0;
+      const preferred = preferredIndex >= 0 ? 60 - preferredIndex : 0;
+      const local = voice.localService ? 10 : 0;
+      const defaultVoice = voice.default ? 5 : 0;
+      return { voice, score: preferred + exactLocale + local + defaultVoice };
+    })
+    .sort((a, b) => b.score - a.score)[0]?.voice ?? candidates[0] ?? null;
 }

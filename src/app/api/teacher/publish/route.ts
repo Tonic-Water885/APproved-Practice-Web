@@ -3,10 +3,8 @@ import { createClient } from "@supabase/supabase-js";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "https://jomlceougvxmnlztppms.supabase.co";
-const supabaseAnonKey =
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpvbWxjZW91Z3Z4bW5senRwcG1zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc5OTIzMjAsImV4cCI6MjA5MzU2ODMyMH0.nvflZjGbg4gCSHVaE1H3ATxUc561YDtetXvcpWViGd8";
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 type PublishScope = {
   areaID?: string;
@@ -15,6 +13,10 @@ type PublishScope = {
 };
 
 export async function POST(request: Request) {
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return Response.json({ error: "Supabase environment variables are not configured" }, { status: 500 });
+  }
+
   const authorization = request.headers.get("authorization");
   if (!authorization) {
     return Response.json({ error: "Missing authorization" }, { status: 401 });
@@ -66,27 +68,24 @@ export async function POST(request: Request) {
   const subtopicIDs = [...new Set(scopes.map((scope) => scope.subtopicID).filter(Boolean) as string[])];
   const unitIDs = [...new Set(scopes.map((scope) => scope.unitID).filter(Boolean) as string[])];
 
-  const [areasResult, subtopicsResult, unitsResult, phrasesResult] = scopes.length
-    ? await Promise.all([
-        areaIDs.length
-          ? curriculumClient.from("curriculum_areas").update({ is_published: true }).in("id", areaIDs).select("id")
-          : { data: [], error: null },
-        subtopicIDs.length
-          ? curriculumClient.from("curriculum_subtopics").update({ is_published: true }).in("id", subtopicIDs).select("id")
-          : { data: [], error: null },
-        unitIDs.length
-          ? curriculumClient.from("curriculum_units").update({ is_published: true }).in("id", unitIDs).select("id")
-          : { data: [], error: null },
-        unitIDs.length
-          ? curriculumClient.from("curriculum_phrases").update({ is_published: true }).in("unit_id", unitIDs).select("id")
-          : { data: [], error: null },
-      ])
-    : await Promise.all([
-        curriculumClient.from("curriculum_areas").update({ is_published: true }).neq("is_published", true).select("id"),
-        curriculumClient.from("curriculum_subtopics").update({ is_published: true }).neq("is_published", true).select("id"),
-        curriculumClient.from("curriculum_units").update({ is_published: true }).neq("is_published", true).select("id"),
-        curriculumClient.from("curriculum_phrases").update({ is_published: true }).neq("is_published", true).select("id"),
-      ]);
+  if (!areaIDs.length && !subtopicIDs.length && !unitIDs.length) {
+    return Response.json({ error: "Publish requires at least one explicit curriculum scope" }, { status: 400 });
+  }
+
+  const [areasResult, subtopicsResult, unitsResult, phrasesResult] = await Promise.all([
+    areaIDs.length
+      ? curriculumClient.from("curriculum_areas").update({ is_published: true }).in("id", areaIDs).select("id")
+      : { data: [], error: null },
+    subtopicIDs.length
+      ? curriculumClient.from("curriculum_subtopics").update({ is_published: true }).in("id", subtopicIDs).select("id")
+      : { data: [], error: null },
+    unitIDs.length
+      ? curriculumClient.from("curriculum_units").update({ is_published: true }).in("id", unitIDs).select("id")
+      : { data: [], error: null },
+    unitIDs.length
+      ? curriculumClient.from("curriculum_phrases").update({ is_published: true }).in("unit_id", unitIDs).select("id")
+      : { data: [], error: null },
+  ]);
 
   const publishError = areasResult.error ?? subtopicsResult.error ?? unitsResult.error ?? phrasesResult.error;
   if (publishError) {

@@ -5,10 +5,8 @@ import type { TeacherLevel } from "@/lib/teacher-curriculum";
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL ?? "https://jomlceougvxmnlztppms.supabase.co";
-const supabaseAnonKey =
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ??
-  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpvbWxjZW91Z3Z4bW5senRwcG1zIiwicm9sZSI6ImFub24iLCJpYXQiOjE3Nzc5OTIzMjAsImV4cCI6MjA5MzU2ODMyMH0.nvflZjGbg4gCSHVaE1H3ATxUc561YDtetXvcpWViGd8";
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
 const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 const tableByLevel: Record<TeacherLevel, string> = {
@@ -19,6 +17,10 @@ const tableByLevel: Record<TeacherLevel, string> = {
 };
 
 export async function POST(request: Request) {
+  if (!supabaseUrl || !supabaseAnonKey) {
+    return Response.json({ error: "Supabase environment variables are not configured" }, { status: 500 });
+  }
+
   const authorization = request.headers.get("authorization");
   if (!authorization) {
     return Response.json({ error: "Missing authorization" }, { status: 401 });

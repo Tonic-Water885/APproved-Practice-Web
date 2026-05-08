@@ -25,6 +25,7 @@ export type CurriculumTopicRow = {
   phrases_fr: string[];
   phrases_it: string[];
   phrases_es: string[];
+  phrase_ids?: string[];
   updated_at?: string;
   created_by?: string | null;
   is_published?: boolean | null;
